@@ -8,3 +8,12 @@ module.exports = {
   theme: { extend: {} },
   plugins: [],
 };
+module.exports = {
+  plugins: {
+    tailwindcss: {},
+    autoprefixer: {},
+  },
+};
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
