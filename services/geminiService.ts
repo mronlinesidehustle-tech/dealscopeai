@@ -1,26 +1,29 @@
+// src/services/geminiService.tsx
 import { GoogleGenAI, GenerateContentResponse, GroundingChunk } from "@google/genai";
 import type { UploadedFile, MockupLevel, GroundingSource, Estimation, InvestmentAnalysis } from '../types';
 
-const apiKey = import.meta.env.VITE_API_KEY as string | undefined;
-if (!apiKey) {
-    throw new Error("VITE_API_KEY environment variable not set");
-}
-
-const ai = new GoogleGenAI({ apiKey });
+const getAi = () => {
+	const apiKey = import.meta.env.VITE_API_KEY as string | undefined;
+	if (!apiKey) {
+		throw new Error("Missing VITE_API_KEY. Add it in Vercel → Project → Settings → Environment Variables.");
+	}
+	return new GoogleGenAI({ apiKey });
+};
 
 const fileToGenerativePart = (file: UploadedFile) => {
-    return {
-        inlineData: {
-            data: file.base64,
-            mimeType: file.type,
-        },
-    };
+	return {
+		inlineData: {
+			data: file.base64,
+			mimeType: file.type,
+		},
+	};
 };
 
 export const getRehabEstimate = async (address: string, files: UploadedFile[], finishLevel: MockupLevel): Promise<{ markdown: string; sources: GroundingSource[] }> => {
-    const model = 'gemini-2.5-flash';
-    
-    const prompt = `
+	const ai = getAi();
+	const model = 'gemini-2.5-flash';
+
+	const prompt = `
         System Instruction: You are an expert real-estate rehab estimator. Your task is to provide a detailed, area-by-area rehabilitation cost estimate based on photos of a property at "${address}".
 
         **Crucial Step: Use Google Search to find local contractor pricing and material costs for the region around "${address}" to ensure accuracy.**
@@ -68,40 +71,61 @@ export const getRehabEstimate = async (address: string, files: UploadedFile[], f
         | [Next Area] | ... | ... | ... | ... |
     `;
 
-    const imageParts = files.map(fileToGenerativePart);
-    
-    const result: GenerateContentResponse = await ai.models.generateContent({
-        model,
-        contents: { parts: [{ text: prompt }, ...imageParts] },
-        config: { 
-            temperature: 0.0,
-            tools: [{googleSearch: {}}],
-        },
-    });
-    
-    const groundingChunks = result.candidates?.[0]?.groundingMetadata?.groundingChunks ?? [];
-    const sources: GroundingSource[] = groundingChunks
-        .filter((chunk: GroundingChunk) => chunk.web?.uri && chunk.web?.title)
-        .map((chunk: GroundingChunk) => ({
-            uri: chunk.web.uri,
-            title: chunk.web.title,
-        }));
+	const imageParts = files.map(fileToGenerativePart);
 
-    return { markdown: result.text, sources };
+	const result: GenerateContentResponse = await ai.models.generateContent({
+		model,
+		contents: { parts: [{ text: prompt }, ...imageParts] },
+		config: {
+			temperature: 0.0,
+			tools: [{ googleSearch: {} }],
+		},
+	});
+
+	if (!result.text) {
+		console.error("Rehab estimate generation failed. The model returned an empty text response. Full response:", JSON.stringify(result, null, 2));
+		throw new Error("The AI model returned an empty response for the rehab estimate. This may be due to a content filter or an internal error.");
+	}
+
+	const groundingChunks = result.candidates?.[0]?.groundingMetadata?.groundingChunks ?? [];
+	const sources: GroundingSource[] = groundingChunks
+		.filter((chunk: GroundingChunk) => chunk.web?.uri && chunk.web?.title)
+		.map((chunk: GroundingChunk) => ({
+			uri: chunk.web.uri,
+			title: chunk.web.title,
+		}));
+
+	return { markdown: result.text, sources };
 };
 
 export const getInvestmentAnalysis = async (
-    address: string,
-    estimation: Estimation,
-    purchasePrice: string
+	address: string,
+	estimation: Estimation,
+	purchasePrice: string
 ): Promise<InvestmentAnalysis> => {
-    const model = 'gemini-2.5-flash';
-    const totalRepairCost = estimation.summary.totalEstimatedCost;
+	const ai = getAi();
+	const model = 'gemini-2.5-flash';
+	const totalRepairCost = estimation.summary.totalEstimatedCost;
 
-    const prompt = `
+	const prompt = `
         **System Instruction:** You are an expert real estate investment analyst. Your task is to provide a comprehensive investment analysis for the property at "${address}", given the estimated rehabilitation costs.
 
-        **CRUCIAL:** Use Google Search extensively to find recent comparable sales (comps) in the local market to determine an accurate After Repair Value (ARV).
+        **CRUCIAL - Multi-Step Process for Finding Comps:**
+        1.  **Identify Property Details & Neighborhood Boundaries:**
+            *   First, use Google Search to find the **"Year Built"** for the subject property at **"${address}"**.
+            *   Second, use Google Search/Maps to identify the specific **subdivision name** of the property.
+            *   Third, identify any **major highways or roads** that act as clear boundaries for this subdivision. Comps should NOT cross these barriers.
+
+        2.  **Find Comps with Quality-First Fallback Logic:** Your goal is to find 1-3 *highly relevant* comparable sales (comps) to determine an accurate After Repair Value (ARV). Quality is more important than quantity. Follow this search process:
+            *   **Attempt 1 (Ideal Criteria):** Search for comps meeting ALL of these strict criteria:
+                *   **Neighborhood:** Located within the **same subdivision** and **NOT separated by a major highway/road**. This is the most important rule.
+                *   **Recency:** Sold within the last **6 months** from today's date.
+                *   **Proximity:** Located within a **0.5-mile radius** of the subject property.
+                *   **Age:** Built within **+/- 10 years** of the subject property's Year Built.
+            *   **Attempt 2 (Relax Proximity):** If you cannot find at least 1-2 comps, relax the proximity to a **1-mile radius** and search again, but strictly maintain all other criteria (same subdivision, no major barriers, 6 months recency, +/- 10 years built).
+            *   **Attempt 3 (Relax Recency):** If you still cannot find at least 1-2 comps, relax the recency to **sold within the last 12 months** and search again, keeping the proximity at 1 mile and the age/neighborhood criteria the same.
+
+        3.  **Report Your Findings:** You MUST populate the \`compsSearchCriteria\` field in the JSON output with a clear statement explaining which criteria were used to find the comps (e.g., "Comps were found using the ideal criteria," or "Comps search criteria were relaxed to a 1-mile radius to find sufficient results."). This is not optional. If you find fewer than 3 comps, that is acceptable as long as they are high quality.
 
         **Property Information:**
         *   **Address:** ${address}
@@ -126,6 +150,7 @@ export const getInvestmentAnalysis = async (
           },
           "propertyCondition": "...",
           "estimatedRepairLevel": "...",
+          "compsSearchCriteria": "...",
           "comparables": [
             {
               "address": "...",
@@ -149,75 +174,85 @@ export const getInvestmentAnalysis = async (
         *   **investorFit:** (Object) - See "GUIDANCE FOR ANALYSIS" above.
         *   **propertyCondition:** (String) A 1-2 sentence summary of the property's overall condition based on the provided summary.
         *   **estimatedRepairLevel:** (String) Classify the rehab level. Must be one of: 'Light Cosmetic', 'Medium', 'Heavy', 'Gut'.
-        *   **comparables:** (Array of Objects) List 3-5 recent comparable sales you found via Google Search.
+        *   **compsSearchCriteria:** (String) A sentence explaining the criteria used to find the comps (e.g., ideal, relaxed radius, relaxed recency).
+        *   **comparables:** (Array of Objects) List 1-3 recent comparable sales you found via Google Search.
         *   **exitStrategies:** (Array of Objects) Propose 2-3 viable exit strategies with brief explanations, following the guidance above.
     `;
 
-    const result = await ai.models.generateContent({
-        model,
-        contents: prompt,
-        config: {
-            temperature: 0.1,
-            tools: [{ googleSearch: {} }],
-        }
-    });
+	const result = await ai.models.generateContent({
+		model,
+		contents: prompt,
+		config: {
+			temperature: 0.1,
+			tools: [{ googleSearch: {} }],
+		}
+	});
 
-    try {
-        const jsonMatch = result.text.match(/```json\n([\s\S]*?)\n```/);
-        if (jsonMatch && jsonMatch[1]) {
-            const parsedJson = JSON.parse(jsonMatch[1]);
+	if (!result.text) {
+		console.error("Investment analysis generation failed. The model returned an empty text response. Full response:", JSON.stringify(result, null, 2));
+		throw new Error("The AI model returned an empty response for the investment analysis. This may be due to a content filter or an internal error.");
+	}
 
-            const parseCurrency = (value: string | number): number => {
-                if (typeof value === 'number') return value;
-                if (typeof value !== 'string') return 0;
-                const match = value.match(/[\d,.]+/);
-                if (!match) return 0;
-                return parseFloat(match[0].replace(/,/g, '')) || 0;
-            };
-            
-            const getMaxFromRange = (range: string): number => {
-                if (typeof range !== 'string') return 0;
-                const matches = range.match(/[\d,.]+/g);
-                if (!matches) return 0;
-                const numbers = matches.map(m => parseFloat(m.replace(/,/g, ''))).filter(n => !isNaN(n));
-                return numbers.length > 0 ? Math.max(...numbers) : 0;
-            };
+	try {
+		const jsonMatch = result.text.match(/```json\n([\s\S]*?)\n```/);
+		if (jsonMatch && jsonMatch[1]) {
+			const parsedJson = JSON.parse(jsonMatch[1]);
 
-            const numericPurchasePrice = parseFloat(purchasePrice) || 0;
-            const numericARV = parseCurrency(parsedJson.suggestedARV);
-            const numericMaxRehab = getMaxFromRange(estimation.summary.totalEstimatedCost);
+			// --- Start of Application-Side Business Logic ---
 
-            const numericMAO = (numericARV * 0.70) - numericMaxRehab;
-            
-            const formattedMAO = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(numericMAO);
-            const formattedPurchasePrice = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(numericPurchasePrice);
+			const parseCurrency = (value: string | number): number => {
+				if (typeof value === 'number') return value;
+				if (typeof value !== 'string') return 0;
+				const match = value.match(/[\d,.]+/);
+				if (!match) return 0;
+				return parseFloat(match[0].replace(/,/g, '')) || 0;
+			};
 
-            parsedJson.suggestedMAO = formattedMAO;
-            parsedJson.purchasePrice = formattedPurchasePrice;
+			const getMaxFromRange = (range: string): number => {
+				if (typeof range !== 'string') return 0;
+				const matches = range.match(/[\d,.]+/g);
+				if (!matches) return 0;
+				const numbers = matches.map(m => parseFloat(m.replace(/,/g, ''))).filter(n => !isNaN(n));
+				return numbers.length > 0 ? Math.max(...numbers) : 0;
+			};
 
-            const fitsCriteria = numericPurchasePrice > 0 && numericMAO > 0 && numericPurchasePrice <= numericMAO;
-            parsedJson.investorFit.fitsCriteria = fitsCriteria;
+			const numericPurchasePrice = parseFloat(purchasePrice) || 0;
+			const numericARV = parseCurrency(parsedJson.suggestedARV);
+			const numericMaxRehab = getMaxFromRange(estimation.summary.totalEstimatedCost);
 
-            const dealVerdict = fitsCriteria
-                ? 'Based on the 70% rule, the purchase price is at or below the Maximum Allowable Offer. This indicates a potentially strong investment opportunity.'
-                : `Warning: Based on the 70% rule, the Maximum Allowable Offer (MAO) for this property is ${formattedMAO}. The current purchase price of ${formattedPurchasePrice} is significantly higher than this target. For this deal to be profitable under standard investor criteria, the property would need to be acquired at or below the MAO.`;
-            
-            parsedJson.investorFit.analysis = `${dealVerdict}\n\n**AI Analysis:**\n${parsedJson.investorFit.analysis}`;
+			const numericMAO = (numericARV * 0.70) - numericMaxRehab;
 
-            const groundingChunks = result.candidates?.[0]?.groundingMetadata?.groundingChunks ?? [];
-            parsedJson.groundingSources = groundingChunks
-                .filter((chunk: GroundingChunk) => chunk.web?.uri && chunk.web?.title)
-                .map((chunk: GroundingChunk) => ({
-                    uri: chunk.web.uri,
-                    title: chunk.web.title,
-                }));
-                
-            return parsedJson as InvestmentAnalysis;
-        } else {
-            throw new Error("Could not find JSON in the model's response for investment analysis.");
-        }
-    } catch (e) {
-        console.error("Failed to parse investment analysis JSON:", e, "Raw response:", result.text);
-        throw new Error("Failed to get a valid investment analysis from the AI.");
-    }
+			const formattedMAO = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(numericMAO);
+			const formattedPurchasePrice = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(numericPurchasePrice);
+
+			parsedJson.suggestedMAO = formattedMAO;
+			parsedJson.purchasePrice = formattedPurchasePrice;
+
+			const fitsCriteria = numericPurchasePrice > 0 && numericMAO > 0 && numericPurchasePrice <= numericMAO;
+			parsedJson.investorFit.fitsCriteria = fitsCriteria;
+
+			const dealVerdict = fitsCriteria
+				? 'Based on the 70% rule, the purchase price is at or below the Maximum Allowable Offer. This indicates a potentially strong investment opportunity.'
+				: `Warning: Based on the 70% rule, the Maximum Allowable Offer (MAO) for this property is ${formattedMAO}. The current purchase price of ${formattedPurchasePrice} is significantly higher than this target. For this deal to be profitable under standard investor criteria, the property would need to be acquired at or below the MAO.`;
+
+			parsedJson.investorFit.analysis = `${dealVerdict}\n\n**AI Analysis:**\n${parsedJson.investorFit.analysis}`;
+
+			// --- End of Application-Side Business Logic ---
+
+			const groundingChunks = result.candidates?.[0]?.groundingMetadata?.groundingChunks ?? [];
+			parsedJson.groundingSources = groundingChunks
+				.filter((chunk: GroundingChunk) => chunk.web?.uri && chunk.web?.title)
+				.map((chunk: GroundingChunk) => ({
+					uri: chunk.web.uri,
+					title: chunk.web.title,
+				}));
+
+			return parsedJson as InvestmentAnalysis;
+		} else {
+			throw new Error("Could not find JSON in the model's response for investment analysis.");
+		}
+	} catch (e) {
+		console.error("Failed to parse investment analysis JSON:", e, "Raw response:", result.text);
+		throw new Error("Failed to get a valid investment analysis from the AI.");
+	}
 };
